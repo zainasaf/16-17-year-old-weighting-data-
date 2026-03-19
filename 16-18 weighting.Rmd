@@ -1,0 +1,1257 @@
+---
+title: "Untitled"
+output: html_document
+date: "2025-07-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r}
+
+library(tidyverse)
+library(readr)
+library(readxl)
+library(here)
+```
+
+```{r}
+
+
+
+ extract_scotland_data <- function(excel_file, sheet_name = "0. Scotland") {
+  
+  # Read the raw Excel data
+  raw_data <- read_excel(excel_file, sheet = sheet_name, col_names = FALSE)
+  
+  # Find the header row (contains ethnic group categories)
+  header_row <- which(str_detect(raw_data[[1]], "Ethnic group"))
+  
+  if (length(header_row) == 0) {
+    stop("Could not find ethnic group header row")
+  }
+  
+  # Extract column headers from the header row
+  headers <- as.character(raw_data[header_row[1], ])
+  headers[is.na(headers)] <- ""
+  
+  # Clean headers - remove empty columns and create meaningful names
+  clean_headers <- c("empty1", "sex", "age", headers[4:length(headers)])
+  clean_headers <- clean_headers[1:ncol(raw_data)]
+  
+  # Find the data sections
+  all_people_start <- which(str_detect(raw_data[[2]], "All people") & 
+                           str_detect(raw_data[[3]], "Total"))[1]
+  female_start <- which(str_detect(raw_data[[2]], "Female") & 
+                       str_detect(raw_data[[3]], "Total"))[1]
+  male_start <- which(str_detect(raw_data[[2]], "Male") & 
+                     str_detect(raw_data[[3]], "Total"))[1]
+  
+  # Function to extract data for a specific section
+  extract_section <- function(start_row, section_name) {
+    # Find where this section ends (next section or end of meaningful data)
+    end_row <- start_row + 25  # Reasonable assumption for age categories
+    
+    section_data <- raw_data[(start_row + 1):end_row, ]
+    
+    # Filter to rows that have age data (not totals or empty rows)
+    age_rows <- section_data[!is.na(section_data[[3]]) & 
+                            section_data[[3]] != "" & 
+                            section_data[[3]] != "Total", ]
+    
+    # Convert to proper data frame with headers
+    colnames(age_rows) <- clean_headers[1:ncol(age_rows)]
+    
+    # Add section identifier
+    age_rows$sex_section <- section_name
+    
+    return(age_rows)
+  }
+  
+  # Extract all three sections
+  all_people_data <- extract_section(all_people_start, "All people")
+  female_data <- extract_section(female_start, "Female") 
+  male_data <- extract_section(male_start, "Male")
+  
+  # Combine sections
+  combined_data <- bind_rows(all_people_data, female_data, male_data)
+  
+  return(combined_data)
+}
+
+# Function to convert wide Scotland data to long format
+convert_scotland_to_long <- function(scotland_wide_data) {
+  
+  # Identify ethnic/demographic columns (skip the first few administrative columns)
+  demographic_cols <- colnames(scotland_wide_data)[4:(ncol(scotland_wide_data)-1)]
+  demographic_cols <- demographic_cols[!is.na(demographic_cols) & demographic_cols != ""]
+  
+  # Convert to long format
+  scotland_long <- scotland_wide_data %>%
+    # Keep essential columns and convert demographic columns to long
+    pivot_longer(
+      cols = all_of(demographic_cols),
+      names_to = "demographic_category", 
+      values_to = "population"
+    ) %>%
+    # Clean up the age column
+    mutate(
+      age_clean = str_trim(as.character(age)),
+      population = as.numeric(population)
+    ) %>%
+    # Filter out NA populations and invalid ages
+    filter(!is.na(population), 
+           !is.na(age_clean),
+           age_clean != "",
+           age_clean != "Total") %>%
+    # Create standard age bins
+    mutate(
+      age_bin = case_when(
+        age_clean == "16 - 17" ~ "16-17",
+        age_clean %in% c("18 - 19", "20 - 24") ~ "18-24", 
+        age_clean %in% c("25 - 29", "30 - 34") ~ "25-34",
+        age_clean %in% c("35 - 39", "40 - 44") ~ "35-44",
+        age_clean %in% c("45 - 49", "50 - 54") ~ "45-54", 
+        age_clean %in% c("55 - 59", "60 - 64") ~ "55-64",
+        age_clean %in% c("65 - 69", "70 - 74") ~ "65-74",
+        age_clean %in% c("75 - 79", "80 - 84", "85+") ~ "75+",
+        TRUE ~ "other"
+      )
+    ) %>%
+    # Filter out ages below 16 and unmatched ages
+    filter(age_bin != "other",
+           !str_detect(age_clean, "^(0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15)")) %>%
+    # Clean up sex categories
+    mutate(
+      sex_clean = case_when(
+        sex_section == "Female" ~ "Female",
+        sex_section == "Male" ~ "Male", 
+        sex_section == "All people" ~ "All people",
+        TRUE ~ sex_section
+      )
+    ) %>%
+    select(sex_clean, age_clean, age_bin, demographic_category, population)
+  
+  return(scotland_long)
+}
+
+# Function to create age-sex-demographic summaries
+summarise_scotland_data <- function(scotland_long_data, demographic_filter = NULL) {
+  
+  # Optionally filter to specific demographic categories
+  if (!is.null(demographic_filter)) {
+    scotland_long_data <- scotland_long_data %>%
+      filter(str_detect(demographic_category, paste(demographic_filter, collapse = "|")))
+  }
+  
+  # Group by age bins and sum populations within demographic categories
+  summary_data <- scotland_long_data %>%
+    # Filter to just Male and Female (not "All people" to avoid double counting)
+    filter(sex_clean %in% c("Male", "Female")) %>%
+    # Group and summarise
+    group_by(sex_clean, age_bin, demographic_category) %>%
+    summarise(
+      total_population = sum(population, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    # Add region identifier
+    mutate(region = "Scotland") %>%
+    # Rename for consistency with England data  
+    rename(`Sex (2 categories)` = sex_clean)
+  
+  return(summary_data)
+}
+
+```
+
+```{r}
+# Let's examine the raw Excel structure first
+print("=== DEBUGGING SCOTLAND EXCEL STRUCTURE ===")
+
+# Read the raw Excel data
+raw_data <- read_excel("scotland_census.xlsx", sheet = "0. Scotland", col_names = FALSE)
+
+print("Raw data dimensions:")
+print(dim(raw_data))
+
+print("\nFirst 20 rows to see the structure:")
+for(i in 1:min(20, nrow(raw_data))) {
+  row_data <- raw_data[i, 1:min(10, ncol(raw_data))]
+  print(paste("Row", i, ":", paste(row_data, collapse = " | ")))
+}
+
+print("\n=== LOOKING FOR HEADER ROW ===")
+# Check for header row containing "Ethnic group"
+header_candidates <- which(str_detect(raw_data[[1]], "Ethnic group", na.rm = TRUE))
+print("Rows containing 'Ethnic group' in column 1:")
+print(header_candidates)
+
+if(length(header_candidates) > 0) {
+  print("Header row content:")
+  header_row <- header_candidates[1]
+  headers <- raw_data[header_row, ]
+  print(headers)
+} else {
+  print("No 'Ethnic group' found in column 1. Let's check other columns:")
+  for(col in 1:min(5, ncol(raw_data))) {
+    ethnic_rows <- which(str_detect(raw_data[[col]], "Ethnic group", na.rm = TRUE))
+    if(length(ethnic_rows) > 0) {
+      print(paste("Found 'Ethnic group' in column", col, "at rows:", paste(ethnic_rows, collapse = ", ")))
+    }
+  }
+}
+
+print("\n=== LOOKING FOR DATA SECTIONS ===")
+# Check for "All people", "Female", "Male" sections
+print("Looking for 'All people' in column 2:")
+all_people_rows <- which(str_detect(raw_data[[2]], "All people", na.rm = TRUE))
+print(all_people_rows)
+if(length(all_people_rows) > 0) {
+  print("Content of first 'All people' row:")
+  print(raw_data[all_people_rows[1], 1:min(10, ncol(raw_data))])
+}
+
+print("\nLooking for 'Female' in column 2:")
+female_rows <- which(str_detect(raw_data[[2]], "Female", na.rm = TRUE))
+print(female_rows)
+if(length(female_rows) > 0) {
+  print("Content of first 'Female' row:")
+  print(raw_data[female_rows[1], 1:min(10, ncol(raw_data))])
+}
+
+print("\nLooking for 'Male' in column 2:")
+male_rows <- which(str_detect(raw_data[[2]], "Male", na.rm = TRUE))
+print(male_rows)
+if(length(male_rows) > 0) {
+  print("Content of first 'Male' row:")
+  print(raw_data[male_rows[1], 1:min(10, ncol(raw_data))])
+}
+
+print("\n=== EXAMINING ROWS 10-30 FOR STRUCTURE ===")
+for(i in 10:min(30, nrow(raw_data))) {
+  row_data <- raw_data[i, 1:min(8, ncol(raw_data))]
+  non_na_count <- sum(!is.na(row_data))
+  if(non_na_count > 2) {  # Only show rows with some content
+    print(paste("Row", i, ":", paste(row_data, collapse = " | ")))
+  }
+}
+
+print("\n=== CHECKING COLUMN NAMES ===")
+print("Default column names assigned by read_excel:")
+print(colnames(raw_data))
+
+```
+
+```{r}
+
+
+
+
+
+
+
+```
+
+```{r}
+
+# Read England & Wales census data (new version with full age categories)
+england_wales_data <- read_csv(here("data", "england_census.csv"))
+
+# Process England & Wales data
+england_wales_processed <- england_wales_data %>%
+  # Filter to 16+ population only
+  filter(!(`Age (17 categories)` %in% c("Aged 15 years and under"))) %>%
+  # Create age bins
+  mutate(
+    age_bin = case_when(
+      `Age (17 categories)` == "Aged 16 to 17 years" ~ "16-17",
+      `Age (17 categories)` %in% c("Aged 18 to 19 years", "Aged 20 to 24 years") ~ "18-24",
+      `Age (17 categories)` %in% c("Aged 25 to 29 years", "Aged 30 to 34 years") ~ "25-34",
+      `Age (17 categories)` %in% c("Aged 35 to 39 years", "Aged 40 to 44 years") ~ "35-44", 
+      `Age (17 categories)` %in% c("Aged 45 to 49 years", "Aged 50 to 54 years") ~ "45-54",
+      `Age (17 categories)` %in% c("Aged 55 to 59 years", "Aged 60 to 64 years") ~ "55-64",
+      `Age (17 categories)` %in% c("Aged 65 to 69 years", "Aged 70 to 74 years") ~ "65-74",
+      `Age (17 categories)` %in% c("Aged 75 to 79 years", "Aged 80 to 84 years", "Aged 85 years and over") ~ "75+",
+      TRUE ~ NA_character_
+    ),
+    region = "England & Wales"
+  ) %>%
+  # Filter out any NA age bins and missing sex categories
+  filter(!is.na(age_bin), !is.na(`Sex (2 categories)`)) %>%
+  # Group and summarize
+  group_by(region, age_bin, `Sex (2 categories)`) %>%
+  summarise(
+    total_population = sum(Observation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Extract Scotland data from Excel file
+# Read the raw Excel data to extract gender-specific data
+scotland_sheet <- read_excel("scotland_census.xlsx", sheet = "0. Scotland", 
+                            range = "A1:H100", col_names = FALSE)
+
+# Create Scotland gender-age data manually from the structure we observed
+# Female data (starts around row 35) and Male data (starts around row 56)
+scotland_manual_data <- tribble(
+  ~region, ~age_bin, ~sex, ~total_population,
+  
+  # FEMALE DATA (extracted from the Female section of Scotland census)
+  "Scotland", "16-17", "Female", 55025,   # Estimate from 16-17 total * female %
+  "Scotland", "18-24", "Female", 235966,  # 18-19 + 20-24 female sections
+  "Scotland", "25-34", "Female", 354776,  # 25-29 + 30-34 female sections  
+  "Scotland", "35-44", "Female", 349805,  # 35-39 + 40-44 female sections
+  "Scotland", "45-54", "Female", 370402,  # 45-49 + 50-54 female sections
+  "Scotland", "55-64", "Female", 401462,  # 55-59 + 60-64 female sections
+  "Scotland", "65-74", "Female", 312545,  # 65-69 + 70-74 female sections
+  "Scotland", "75+", "Female",   282544,    # 75-79 + 80+ female sections
+  
+  # MALE DATA (extracted from the Male section of Scotland census)
+  "Scotland", "16-17", "Male", 58038,     # Estimate from 16-17 total * male %
+  "Scotland", "18-24", "Male", 233448,    # 18-19 + 20-24 male sections
+  "Scotland", "25-34", "Male", 339420,   # 25-29 + 30-34 male sections
+  "Scotland", "35-44", "Male", 331244,    # 35-39 + 40-44 male sections  
+  "Scotland", "45-54", "Male", 349141,    # 45-49 + 50-54 male sections
+  "Scotland", "55-64", "Male", 378824,    # 55-59 + 60-64 male sections
+  "Scotland", "65-74", "Male", 287378,    # 65-69 + 70-74 male sections
+  "Scotland", "75+", "Male",   208045,      # 75-79 + 80+ male sections
+) %>%
+  rename(`Sex (2 categories)` = sex)
+
+# Combine England & Wales and Scotland data  
+combined_uk_data <- bind_rows(
+  england_wales_processed,
+  scotland_manual_data
+)
+
+# Calculate final weighting targets
+weighting_targets <- combined_uk_data %>%
+  # Calculate total UK population 16+
+  mutate(
+    total_uk_population = sum(total_population)
+  ) %>%
+  # Calculate percentages
+  mutate(
+    percentage_of_total = (total_population / total_uk_population) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  # Create clean labels
+  mutate(
+    gender_age_group = paste(`Sex (2 categories)`, age_bin, sep = " "),
+    region_gender_age = paste(region, `Sex (2 categories)`, age_bin, sep = " - ")
+  ) %>%
+  arrange(region, `Sex (2 categories)`, age_bin)
+
+# Display results
+print("=== POLL WEIGHTING TARGETS FOR 16+ POPULATION ===")
+print(paste("Total UK population 16+:", scales::comma(sum(combined_uk_data$total_population))))
+
+print("\n=== BY GENDER-AGE COMBINATION (UK TOTAL) ===")
+uk_gender_age_totals <- weighting_targets %>%
+  group_by(gender_age_group) %>%
+  summarise(
+    total_population = sum(total_population),
+    percentage_of_total = sum(percentage_of_total),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_population))
+
+print(uk_gender_age_totals)
+
+print("\n=== BY REGION-GENDER-AGE COMBINATION ===")
+regional_breakdown <- weighting_targets %>%
+  select(region_gender_age, total_population, percentage_of_total) %>%
+  arrange(desc(total_population))
+
+print(regional_breakdown)
+
+print("\n=== VERIFICATION: TOTALS SHOULD SUM TO 100% ===")
+print(paste("UK Gender-Age total:", round(sum(uk_gender_age_totals$percentage_of_total), 2), "%"))
+print(paste("Regional breakdown total:", round(sum(weighting_targets$percentage_of_total), 2), "%"))
+
+# Create clean output tables for poll weighting
+print("\n=== CLEAN WEIGHTING TABLE FOR POLLING ===")
+
+# UK-wide gender-age targets
+uk_targets <- uk_gender_age_totals %>%
+  select(`Gender-Age Group` = gender_age_group, 
+         `Population` = total_population,
+         `Weight %` = percentage_of_total) %>%
+  mutate(
+    Population = scales::comma(Population),
+    `Weight %` = paste0(round(`Weight %`, 2), "%")
+  )
+
+print("UK-wide Gender-Age Targets:")
+print(uk_targets)
+
+# Regional targets
+regional_targets <- weighting_targets %>%
+  select(`Region-Gender-Age` = region_gender_age,
+         `Population` = total_population, 
+         `Weight %` = percentage_of_total) %>%
+  mutate(
+    Population = scales::comma(Population),
+    `Weight %` = paste0(round(`Weight %`, 2), "%")
+  )
+
+print("\nRegional Gender-Age Targets:")
+print(regional_targets)
+
+# Additional breakdown by region only
+print("\n=== REGIONAL TOTALS ===")
+regional_totals <- weighting_targets %>%
+  group_by(region) %>%
+  summarise(
+    total_population = sum(total_population),
+    percentage_of_total = sum(percentage_of_total),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Population = scales::comma(total_population),
+    `Weight %` = paste0(round(percentage_of_total, 2), "%")
+  ) %>%
+  select(Region = region, Population, `Weight %`)
+
+print(regional_totals)
+
+# Save results
+write_csv(uk_targets, "uk_poll_weights_16plus.csv")
+write_csv(regional_targets, "regional_poll_weights_16plus.csv") 
+write_csv(regional_totals, "regional_totals_16plus.csv")
+
+print("\n=== FILES SAVED ===")
+print("- uk_poll_weights_16plus.csv")
+print("- regional_poll_weights_16plus.csv") 
+print("- regional_totals_16plus.csv")
+
+# IMPORTANT NOTE: Scotland figures above are estimates
+# To get exact figures, we need to properly extract the gender-age data from the Excel file
+print("\n=== NOTE ===")
+print("Scotland figures are estimates. For exact figures, we need to properly")
+print("extract the gender-disaggregated data from the Excel file rows 35+ (Female)")
+print("and rows 56+ (Male). Would you like me to do this extraction?")
+
+```
+
+
+```{r}
+
+england_wales_data <- read_csv(here("data", "england_census.csv"))
+
+
+
+# Process England & Wales data - keeping the regional breakdown
+england_wales_processed <- england_wales_data %>%
+  # Filter to 16+ population only
+  filter(!(`Age (17 categories)` %in% c("Aged 15 years and under"))) %>%
+  # Create age bins (using the 17 age categories for better detail)
+  mutate(
+    age_bin = case_when(
+      `Age (17 categories)` == "Aged 16 to 17 years" ~ "16-17",
+      `Age (17 categories)` %in% c("Aged 18 to 19 years", "Aged 20 to 24 years") ~ "18-24",
+      `Age (17 categories)` %in% c("Aged 25 to 29 years", "Aged 30 to 34 years") ~ "25-34",
+      `Age (17 categories)` %in% c("Aged 35 to 39 years", "Aged 40 to 44 years") ~ "35-44", 
+      `Age (17 categories)` %in% c("Aged 45 to 49 years", "Aged 50 to 54 years") ~ "45-54",
+      `Age (17 categories)` %in% c("Aged 55 to 59 years", "Aged 60 to 64 years") ~ "55-64",
+      `Age (17 categories)` %in% c("Aged 65 to 69 years", "Aged 70 to 74 years") ~ "65-74",
+      `Age (17 categories)` %in% c("Aged 75 to 79 years", "Aged 80 to 84 years", "Aged 85 years and over") ~ "75+",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  # Filter out any NA age bins and missing sex categories
+  filter(!is.na(age_bin), !is.na(`Sex (2 categories)`)) %>%
+  # Keep the Regions column for regional breakdown, but also create combined England & Wales
+  mutate(
+    combined_region = "England & Wales"  # For gender-age analysis
+  ) %>%
+  # Group and summarize by both individual regions and combined
+  group_by(Regions, combined_region, age_bin, `Sex (2 categories)`) %>%
+  summarise(
+    total_population = sum(Observation, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print("England & Wales data processed successfully!")
+print("Regions found:")
+print(unique(england_wales_processed$Regions))
+print(paste("England & Wales 16+ population:", scales::comma(sum(england_wales_processed$total_population))))
+
+# =============================================================================
+# PART 2: SCOTLAND DATA (MANUAL ENTRY - UPDATE THESE NUMBERS)
+# =============================================================================
+
+print("\n=== SCOTLAND DATA - MANUAL ENTRY SECTION ===")
+print("UPDATE THE NUMBERS BELOW WITH CORRECT SCOTLAND CENSUS FIGURES")
+
+# SCOTLAND DATA - CORRECT FIGURES PROVIDED BY USER
+# Now matches England & Wales age bin structure perfectly
+scotland_manual_data <- tribble(
+  ~region, ~age_bin, ~sex, ~total_population,
+  
+  # =========================================================================
+  # FEMALE DATA - CORRECT SCOTLAND CENSUS FIGURES
+  # =========================================================================
+  "Scotland", "16-17", "Female", 55025,    # Correct figure
+  "Scotland", "18-24", "Female", 235966,   # 18-19 + 20-24 from Female section  
+  "Scotland", "25-34", "Female", 354776,   # 25-29 + 30-34 from Female section
+  "Scotland", "35-44", "Female", 349805,   # 35-39 + 40-44 from Female section
+  "Scotland", "45-54", "Female", 370402,   # 45-49 + 50-54 from Female section
+  "Scotland", "55-64", "Female", 401462,   # 55-59 + 60-64 from Female section
+  "Scotland", "65-74", "Female", 312545,   # 65-69 + 70-74 from Female section
+  "Scotland", "75+", "Female", 282544,     # 75-79 + 80+ from Female section
+  
+  # =========================================================================
+  # MALE DATA - CORRECT SCOTLAND CENSUS FIGURES  
+  # =========================================================================
+  "Scotland", "16-17", "Male", 58038,      # Correct figure
+  "Scotland", "18-24", "Male", 233448,     # 18-19 + 20-24 from Male section
+  "Scotland", "25-34", "Male", 339420,     # 25-29 + 30-34 from Male section
+  "Scotland", "35-44", "Male", 331244,     # 35-39 + 40-44 from Male section
+  "Scotland", "45-54", "Male", 349141,     # 45-49 + 50-54 from Male section
+  "Scotland", "55-64", "Male", 378824,     # 55-59 + 60-64 from Male section
+  "Scotland", "65-74", "Male", 287378,     # 65-69 + 70-74 from Male section
+  "Scotland", "75+", "Male", 208045        # 75-79 + 80+ from Male section
+) %>%
+  rename(`Sex (2 categories)` = sex)
+
+print("Scotland data loaded with current figures")
+print(paste("Scotland 16+ population:", scales::comma(sum(scotland_manual_data$total_population))))
+
+# =============================================================================
+# PART 3: COMBINE DATA AND CALCULATE POLL WEIGHTS (AUTOMATED)
+# =============================================================================
+
+print("\n=== COMBINING DATA AND CALCULATING POLL WEIGHTS ===")
+
+# Combine England & Wales and Scotland data for gender-age analysis
+combined_uk_data <- bind_rows(
+  # England & Wales combined for gender-age breakdown
+  england_wales_processed %>% 
+    select(region = combined_region, age_bin, `Sex (2 categories)`, total_population),
+  # Scotland data
+  scotland_manual_data
+)
+
+# Also create regional data (9 regions: 8 England regions + Wales + Scotland)
+regional_data <- bind_rows(
+  # Individual England regions + Wales
+  england_wales_processed %>%
+    select(region = Regions, age_bin, `Sex (2 categories)`, total_population),
+  # Scotland
+  scotland_manual_data %>%
+    mutate(region = "Scotland")
+)
+
+# Calculate final weighting targets
+weighting_targets <- combined_uk_data %>%
+  # Calculate total UK population 16+
+  mutate(
+    total_uk_population = sum(total_population)
+  ) %>%
+  # Calculate percentages
+  mutate(
+    percentage_of_total = (total_population / total_uk_population) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  # Create clean labels
+  mutate(
+    gender_age_group = paste(`Sex (2 categories)`, age_bin, sep = " "),
+    region_gender_age = paste(region, `Sex (2 categories)`, age_bin, sep = " - ")
+  ) %>%
+  arrange(region, `Sex (2 categories)`, age_bin)
+
+# =============================================================================
+# PART 4: DISPLAY RESULTS
+# =============================================================================
+
+print("=== POLL WEIGHTING TARGETS FOR 16+ POPULATION ===")
+print(paste("Total UK population 16+:", scales::comma(sum(combined_uk_data$total_population))))
+
+print("\n=== BY GENDER-AGE COMBINATION (UK TOTAL) ===")
+uk_gender_age_totals <- weighting_targets %>%
+  group_by(gender_age_group) %>%
+  summarise(
+    total_population = sum(total_population),
+    percentage_of_total = sum(percentage_of_total),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(total_population))
+
+print(uk_gender_age_totals)
+
+print("\n=== BY REGION-GENDER-AGE COMBINATION ===")
+regional_breakdown <- weighting_targets %>%
+  select(region_gender_age, total_population, percentage_of_total) %>%
+  arrange(desc(total_population))
+
+print(regional_breakdown)
+
+print("\n=== VERIFICATION: TOTALS SHOULD SUM TO 100% ===")
+print(paste("UK Gender-Age total:", round(sum(uk_gender_age_totals$percentage_of_total), 2), "%"))
+print(paste("Regional breakdown total:", round(sum(weighting_targets$percentage_of_total), 2), "%"))
+
+# Create clean output tables for poll weighting
+print("\n=== CLEAN WEIGHTING TABLE FOR POLLING ===")
+
+# UK-wide gender-age targets
+uk_targets <- uk_gender_age_totals %>%
+  select(`Gender-Age Group` = gender_age_group, 
+         `Population` = total_population,
+         `Weight %` = percentage_of_total) %>%
+  mutate(
+    Population = scales::comma(Population),
+    `Weight %` = paste0(round(`Weight %`, 2), "%")
+  )
+
+print("UK-wide Gender-Age Targets:")
+print(uk_targets)
+
+# Regional targets
+regional_targets <- weighting_targets %>%
+  select(`Region-Gender-Age` = region_gender_age,
+         `Population` = total_population, 
+         `Weight %` = percentage_of_total) %>%
+  mutate(
+    Population = scales::comma(Population),
+    `Weight %` = paste0(round(`Weight %`, 2), "%")
+  )
+
+print("\nRegional Gender-Age Targets:")
+print(regional_targets)
+
+# Additional breakdown by the 11 regions (9 England + Wales + Scotland)
+print("\n=== 11 REGIONS BREAKDOWN (9 ENGLAND REGIONS + WALES + SCOTLAND) ===")
+eleven_regions_totals <- regional_data %>%
+  group_by(region) %>%
+  summarise(
+    total_population = sum(total_population),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percentage_of_total = (total_population / sum(total_population)) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  arrange(desc(total_population)) %>%
+  mutate(
+    Population = scales::comma(total_population),
+    `Weight %` = paste0(percentage_of_total, "%")
+  ) %>%
+  select(Region = region, Population, `Weight %`)
+
+print(eleven_regions_totals)
+
+# Calculate Scotland's proportion specifically
+scotland_total <- sum(scotland_manual_data$total_population)
+uk_total <- sum(combined_uk_data$total_population)
+scotland_percentage <- (scotland_total / uk_total) * 100
+
+print(paste("\nScotland specific calculation:"))
+print(paste("Scotland 16+ population:", scales::comma(scotland_total)))
+print(paste("UK total 16+ population:", scales::comma(uk_total))) 
+
+```
+
+
+```{r}
+
+
+print("=== ETHNIC GROUP PROPORTIONS FOR 16+ POPULATION ===")
+
+# =============================================================================
+# PART 1: ENGLAND & WALES ETHNICITY DATA
+# =============================================================================
+
+print("Processing England & Wales ethnicity data...")
+
+# Read England & Wales census data (the one with 20 ethnic categories)
+england_wales_ethnicity <- read_csv(here("data", "england_census.csv"))
+
+# Process England & Wales ethnicity data
+england_wales_ethnic_processed <- england_wales_ethnicity %>%
+  # Filter to 16+ population only (matching your poll weighting approach)
+  filter(!(`Age (17 categories)` %in% c("Aged 15 years and under"))) %>%
+  # Recode ethnicity categories using str_detect for flexibility
+  mutate(
+    ethnicity_recoded = case_when(
+        str_detect(`Ethnic group (20 categories)`, "Mixed|Multiple") ~ "Mixed",  # Check Mixed first,
+      str_detect(`Ethnic group (20 categories)`, "White") ~ "White",
+      str_detect(`Ethnic group (20 categories)`, "Asian") ~ "Asian", 
+      str_detect(`Ethnic group (20 categories)`, "Black") ~ "Black",
+      str_detect(`Ethnic group (20 categories)`, "Other") ~ "Other",
+      str_detect(`Ethnic group (20 categories)`, "Does not apply") ~ "Does not apply",
+      TRUE ~ "Other"  # Catch any remaining categories
+    )
+  ) %>%
+  # Remove "Does not apply" category
+  filter(ethnicity_recoded != "Does not apply") %>%
+  # Group by ethnicity and calculate totals
+  group_by(ethnicity_recoded) %>%
+  summarise(
+    england_wales_population = sum(Observation, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(region = "England & Wales")
+
+print("England & Wales ethnic groups found:")
+print(england_wales_ethnic_processed)
+
+# =============================================================================
+# PART 2: SCOTLAND ETHNICITY DATA (MANUAL ENTRY FOR NOW)
+# =============================================================================
+
+print("\nProcessing Scotland ethnicity data...")
+
+# Scotland ethnicity data - you can update these with actual figures
+# For now, using estimated proportions based on typical Scotland demographics
+scotland_ethnic_data <- tribble(
+  ~ethnicity_recoded, ~scotland_population, ~region,
+  "White", 4265998,    "Scotland",  # Update with actual Scotland White 16+ population
+  "Asian", 163130,     "Scotland",  # Update with actual Scotland Asian 16+ population  
+  "Mixed", 36016,      "Scotland",  # Update with actual Scotland Mixed 16+ population
+  "Black", 45736,      "Scotland",  # Update with actual Scotland Black 16+ population
+  "Other", 37705,      "Scotland"   # Update with actual Scotland Other 16+ population
+)
+
+print("Scotland ethnic groups (UPDATE WITH ACTUAL FIGURES):")
+print(scotland_ethnic_data)
+
+# =============================================================================
+# PART 3: COMBINE AND CALCULATE UK ETHNIC PROPORTIONS
+# =============================================================================
+
+print("\nCalculating combined UK ethnic proportions...")
+
+# Combine England & Wales and Scotland data
+uk_ethnic_combined <- bind_rows(
+  england_wales_ethnic_processed %>% 
+    rename(population = england_wales_population),
+  scotland_ethnic_data %>% 
+    rename(population = scotland_population)
+)
+
+# Calculate UK totals by ethnic group
+uk_ethnic_totals <- uk_ethnic_combined %>%
+  group_by(ethnicity_recoded) %>%
+  summarise(
+    total_uk_population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentages
+  mutate(
+    total_population_all_groups = sum(total_uk_population),
+    percentage_of_total = (total_uk_population / total_population_all_groups) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  # Sort by population size
+  arrange(desc(total_uk_population)) %>%
+  # Create clean display format
+  mutate(
+    Population = scales::comma(total_uk_population),
+    `Percentage %` = paste0(percentage_of_total, "%")
+  ) %>%
+  select(`Ethnic Group` = ethnicity_recoded, Population, `Percentage %`)
+
+print("=== UK ETHNIC GROUP PROPORTIONS (16+ POPULATION) ===")
+print(uk_ethnic_totals)
+
+# Verification
+total_percentage <- uk_ethnic_combined %>%
+  summarise(total = sum(population)) %>%
+  pull(total)
+
+print(paste("\nTotal 16+ population across all ethnic groups:", scales::comma(total_percentage)))
+
+verification_sum <- uk_ethnic_combined %>%
+  group_by(ethnicity_recoded) %>%
+  summarise(total = sum(population)) %>%
+  mutate(pct = (total / sum(total)) * 100) %>%
+  summarise(total_pct = sum(pct)) %>%
+  pull(total_pct)
+
+print(paste("Verification - percentages sum to:", round(verification_sum, 2), "%"))
+
+# =============================================================================
+# PART 4: DETAILED BREAKDOWN BY REGION AND ETHNICITY
+# =============================================================================
+
+print("\n=== DETAILED BREAKDOWN BY REGION AND ETHNICITY ===")
+
+regional_ethnic_breakdown <- uk_ethnic_combined %>%
+  group_by(region, ethnicity_recoded) %>%
+  summarise(
+    population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentage within each region
+  group_by(region) %>%
+  mutate(
+    region_total = sum(population),
+    percentage_within_region = (population / region_total) * 100,
+    percentage_within_region = round(percentage_within_region, 2)
+  ) %>%
+  ungroup() %>%
+  # Calculate percentage of total UK
+  mutate(
+    uk_total = sum(population),
+    percentage_of_uk = (population / uk_total) * 100,
+    percentage_of_uk = round(percentage_of_uk, 2)
+  ) %>%
+  arrange(region, desc(population)) %>%
+  select(Region = region, 
+         `Ethnic Group` = ethnicity_recoded, 
+         Population = population,
+         `% within Region` = percentage_within_region,
+         `% of UK Total` = percentage_of_uk)
+
+print(regional_ethnic_breakdown)
+
+# =============================================================================
+# PART 5: SAVE RESULTS
+# =============================================================================
+
+write_csv(uk_ethnic_totals, "uk_ethnic_proportions_16plus.csv")
+write_csv(regional_ethnic_breakdown, "regional_ethnic_breakdown_16plus.csv")
+
+print("\n=== FILES SAVED ===")
+print("- uk_ethnic_proportions_16plus.csv")
+print("- regional_ethnic_breakdown_16plus.csv")
+
+print("\n=== TO UPDATE SCOTLAND FIGURES ===")
+print("1. Replace the estimated Scotland figures in PART 2")
+print("2. Use actual Scotland census ethnic group data for 16+ population")
+print("3. Re-run to get accurate UK ethnic proportions")
+
+
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(readxl)
+
+print("=== UK UNIVERSITY VS NON-UNIVERSITY PROPORTIONS (16+ POPULATION) ===")
+
+# =============================================================================
+# PART 1: ENGLAND & WALES EDUCATION DATA
+# =============================================================================
+
+print("Processing England & Wales education data...")
+
+# Read England & Wales census data 
+england_wales_education <- read_csv("england_census.csv")
+
+# Process England & Wales education data
+england_wales_edu_processed <- england_wales_education %>%
+  # Filter to 16+ population only (matching your other analyses)
+  filter(!(`Age (17 categories)` %in% c("Aged 15 years and under"))) %>%
+  # Create university/no_university binary variable
+  mutate(
+    university_status = case_when(
+      str_detect(`Highest level of qualification (7 categories)`, "^Level 4") ~ "University",
+      `Highest level of qualification (7 categories)` == "Does not apply" ~ "Does not apply",
+      TRUE ~ "No University"
+    )
+  ) %>%
+  # Remove "Does not apply" (children/non-applicable cases)
+  filter(university_status != "Does not apply") %>%
+  # Group by university status and calculate totals
+  group_by(university_status) %>%
+  summarise(
+    england_wales_population = sum(Observation, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(region = "England & Wales")
+
+print("England & Wales education breakdown:")
+print(england_wales_edu_processed)
+
+# =============================================================================
+# PART 2: SCOTLAND EDUCATION DATA (FROM EXCEL FILE)
+# =============================================================================
+
+print("\nProcessing Scotland education data...")
+
+# Read Scotland education data from Excel
+scotland_edu_raw <- read_excel("scotland_education.xlsx", 
+                               sheet = "Data Sheet 0", 
+                               skip = 12,  # Skip to the data row
+                               col_names = c("empty", "country", "total_16plus", "no_quals", 
+                                           "lower_school", "upper_school", "apprenticeship", 
+                                           "further_ed", "degree_plus"))
+
+# Process Scotland education data
+scotland_edu_processed <- scotland_edu_raw %>%
+  filter(country == "Scotland") %>%
+  # Create university vs non-university totals
+  summarise(
+    # University = "Degree level qualifications or above" (column 9)
+    University = degree_plus,
+    
+    # No University = All other qualification categories combined
+    `No University` = no_quals + lower_school + upper_school + apprenticeship + further_ed,
+    
+    .groups = "drop"
+  ) %>%
+  # Convert to long format to match England & Wales structure
+  pivot_longer(
+    cols = c(University, `No University`),
+    names_to = "university_status",
+    values_to = "scotland_population"
+  ) %>%
+  mutate(region = "Scotland")
+
+print("Scotland education breakdown:")
+print(scotland_edu_processed)
+
+# =============================================================================
+# PART 3: COMBINE AND CALCULATE UK UNIVERSITY PROPORTIONS
+# =============================================================================
+
+print("\nCalculating combined UK university proportions...")
+
+# Combine England & Wales and Scotland data
+uk_education_combined <- bind_rows(
+  england_wales_edu_processed %>% 
+    rename(population = england_wales_population),
+  scotland_edu_processed %>% 
+    rename(population = scotland_population)
+)
+
+# Calculate UK totals by education level
+uk_education_totals <- uk_education_combined %>%
+  group_by(university_status) %>%
+  summarise(
+    total_uk_population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentages
+  mutate(
+    total_population_all_education = sum(total_uk_population),
+    percentage_of_total = (total_uk_population / total_population_all_education) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  # Sort by population size (University likely smaller)
+  arrange(desc(total_uk_population)) %>%
+  # Create clean display format
+  mutate(
+    Population = scales::comma(total_uk_population),
+    `Percentage %` = paste0(percentage_of_total, "%")
+  ) %>%
+  select(`Education Level` = university_status, Population, `Percentage %`)
+
+print("=== UK EDUCATION PROPORTIONS (16+ POPULATION) ===")
+print(uk_education_totals)
+
+# Verification
+total_population <- sum(uk_education_combined$population)
+print(paste("\nTotal 16+ population with education data:", scales::comma(total_population)))
+
+verification_sum <- uk_education_combined %>%
+  group_by(university_status) %>%
+  summarise(total = sum(population)) %>%
+  mutate(pct = (total / sum(total)) * 100) %>%
+  summarise(total_pct = sum(pct)) %>%
+  pull(total_pct)
+
+print(paste("Verification - percentages sum to:", round(verification_sum, 2), "%"))
+
+# =============================================================================
+# PART 4: DETAILED BREAKDOWN BY REGION AND EDUCATION
+# =============================================================================
+
+print("\n=== DETAILED BREAKDOWN BY REGION AND EDUCATION ===")
+
+regional_education_breakdown <- uk_education_combined %>%
+  group_by(region, university_status) %>%
+  summarise(
+    population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentage within each region
+  group_by(region) %>%
+  mutate(
+    region_total = sum(population),
+    percentage_within_region = (population / region_total) * 100,
+    percentage_within_region = round(percentage_within_region, 2)
+  ) %>%
+  ungroup() %>%
+  # Calculate percentage of total UK
+  mutate(
+    uk_total = sum(population),
+    percentage_of_uk = (population / uk_total) * 100,
+    percentage_of_uk = round(percentage_of_uk, 2)
+  ) %>%
+  arrange(region, desc(population)) %>%
+  select(Region = region, 
+         `Education Level` = university_status, 
+         Population = population,
+         `% within Region` = percentage_within_region,
+         `% of UK Total` = percentage_of_uk)
+
+print(regional_education_breakdown)
+
+# =============================================================================
+# PART 5: SUMMARY STATISTICS
+# =============================================================================
+
+print("\n=== SUMMARY STATISTICS ===")
+
+# Calculate key statistics
+university_percentage <- uk_education_totals %>%
+  filter(`Education Level` == "University") %>%
+  pull(`Percentage %`)
+
+no_university_percentage <- uk_education_totals %>%
+  filter(`Education Level` == "No University") %>%
+  pull(`Percentage %`)
+
+print(paste("UK 16+ population with University degree:", university_percentage))
+print(paste("UK 16+ population without University degree:", no_university_percentage))
+
+# Scotland vs England & Wales comparison
+scotland_uni_rate <- regional_education_breakdown %>%
+  filter(Region == "Scotland", `Education Level` == "University") %>%
+  pull(`% within Region`)
+
+ew_uni_rate <- regional_education_breakdown %>%
+  filter(Region == "England & Wales", `Education Level` == "University") %>%
+  pull(`% within Region`)
+
+print(paste("\nUniversity degree rates by region:"))
+print(paste("Scotland:", scotland_uni_rate, "%"))
+print(paste("England & Wales:", ew_uni_rate, "%"))
+
+# =============================================================================
+# PART 6: SAVE RESULTS
+# =============================================================================
+
+write_csv(uk_education_totals, "uk_education_proportions_16plus.csv")
+write_csv(regional_education_breakdown, "regional_education_breakdown_16plus.csv")
+
+print("\n=== FILES SAVED ===")
+print("- uk_education_proportions_16plus.csv")
+print("- regional_education_breakdown_16plus.csv")
+
+print("\n=== READY FOR POLL WEIGHTING ===")
+print("You now have UK-wide education proportions for 16+ population:")
+print("- University degree holders: X%") 
+print("- Non-university degree holders: Y%")
+print("These can be used as weighting targets for your polling!")
+
+```
+
+```{r}
+
+library(tidyverse)
+library(readr)
+library(readxl)
+
+print("=== UK UNIVERSITY VS NON-UNIVERSITY PROPORTIONS (16+ POPULATION) ===")
+
+# =============================================================================
+# PART 1: ENGLAND & WALES EDUCATION DATA
+# =============================================================================
+
+print("Processing England & Wales education data...")
+
+# Read England & Wales census data 
+england_wales_education <- read_csv(here("data", "england_census.csv"))
+
+# Process England & Wales education data
+england_wales_edu_processed <- england_wales_education %>%
+  # Filter to 16+ population only (matching your other analyses)
+  filter(!(`Age (17 categories)` %in% c("Aged 15 years and under"))) %>%
+  # Create university/no_university binary variable
+  mutate(
+    university_status = case_when(
+      str_detect(`Highest level of qualification (7 categories)`, "^Level 4") ~ "University",
+      `Highest level of qualification (7 categories)` == "Does not apply" ~ "Does not apply",
+      TRUE ~ "No University"
+    )
+  ) %>%
+  # Remove "Does not apply" (children/non-applicable cases)
+  filter(university_status != "Does not apply") %>%
+  # Group by university status and calculate totals
+  group_by(university_status) %>%
+  summarise(
+    england_wales_population = sum(Observation, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(region = "England & Wales")
+
+print("England & Wales education breakdown:")
+print(england_wales_edu_processed)
+
+# =============================================================================
+# PART 2: SCOTLAND EDUCATION DATA (FROM EXCEL FILE)
+# =============================================================================
+
+print("\nProcessing Scotland education data...")
+
+# Read Scotland education data from CSV
+scotland_edu_raw <- read_csv(here("data", "scotland_education.csv", 
+                            skip = 14,  # Skip to the data row (line 15, so skip 14)
+                            col_names = c("empty", "country", "total_16plus", "no_quals", 
+                                        "lower_school", "upper_school", "apprenticeship", 
+                                        "further_ed", "degree_plus"))
+
+
+# Process Scotland education data
+scotland_edu_processed <- scotland_edu_raw %>%
+  filter(country == "Scotland") %>%
+  # Create university vs non-university totals
+  summarise(
+    # University = "Degree level qualifications or above" (column 9)
+    University = degree_plus,
+    
+    # No University = All other qualification categories combined
+    `No University` = no_quals + lower_school + upper_school + apprenticeship + further_ed,
+    
+    .groups = "drop"
+  ) %>%
+  # Convert to long format to match England & Wales structure
+  pivot_longer(
+    cols = c(University, `No University`),
+    names_to = "university_status",
+    values_to = "scotland_population"
+  ) %>%
+  mutate(region = "Scotland")
+
+print("Scotland education breakdown:")
+print(scotland_edu_processed)
+
+# =============================================================================
+# PART 3: COMBINE AND CALCULATE UK UNIVERSITY PROPORTIONS
+# =============================================================================
+
+print("\nCalculating combined UK university proportions...")
+
+# Combine England & Wales and Scotland data
+uk_education_combined <- bind_rows(
+  england_wales_edu_processed %>% 
+    rename(population = england_wales_population),
+  scotland_edu_processed %>% 
+    rename(population = scotland_population)
+)
+
+# Calculate UK totals by education level
+uk_education_totals <- uk_education_combined %>%
+  group_by(university_status) %>%
+  summarise(
+    total_uk_population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentages
+  mutate(
+    total_population_all_education = sum(total_uk_population),
+    percentage_of_total = (total_uk_population / total_population_all_education) * 100,
+    percentage_of_total = round(percentage_of_total, 2)
+  ) %>%
+  # Sort by population size (University likely smaller)
+  arrange(desc(total_uk_population)) %>%
+  # Create clean display format
+  mutate(
+    Population = scales::comma(total_uk_population),
+    `Percentage %` = paste0(percentage_of_total, "%")
+  ) %>%
+  select(`Education Level` = university_status, Population, `Percentage %`)
+
+print("=== UK EDUCATION PROPORTIONS (16+ POPULATION) ===")
+print(uk_education_totals)
+
+# Verification
+total_population <- sum(uk_education_combined$population)
+print(paste("\nTotal 16+ population with education data:", scales::comma(total_population)))
+
+verification_sum <- uk_education_combined %>%
+  group_by(university_status) %>%
+  summarise(total = sum(population)) %>%
+  mutate(pct = (total / sum(total)) * 100) %>%
+  summarise(total_pct = sum(pct)) %>%
+  pull(total_pct)
+
+print(paste("Verification - percentages sum to:", round(verification_sum, 2), "%"))
+
+# =============================================================================
+# PART 4: DETAILED BREAKDOWN BY REGION AND EDUCATION
+# =============================================================================
+
+print("\n=== DETAILED BREAKDOWN BY REGION AND EDUCATION ===")
+
+regional_education_breakdown <- uk_education_combined %>%
+  group_by(region, university_status) %>%
+  summarise(
+    population = sum(population, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Calculate percentage within each region
+  group_by(region) %>%
+  mutate(
+    region_total = sum(population),
+    percentage_within_region = (population / region_total) * 100,
+    percentage_within_region = round(percentage_within_region, 2)
+  ) %>%
+  ungroup() %>%
+  # Calculate percentage of total UK
+  mutate(
+    uk_total = sum(population),
+    percentage_of_uk = (population / uk_total) * 100,
+    percentage_of_uk = round(percentage_of_uk, 2)
+  ) %>%
+  arrange(region, desc(population)) %>%
+  select(Region = region, 
+         `Education Level` = university_status, 
+         Population = population,
+         `% within Region` = percentage_within_region,
+         `% of UK Total` = percentage_of_uk)
+
+print(regional_education_breakdown)
+
+# =============================================================================
+# PART 5: SUMMARY STATISTICS
+# =============================================================================
+
+print("\n=== SUMMARY STATISTICS ===")
+
+# Calculate key statistics
+university_percentage <- uk_education_totals %>%
+  filter(`Education Level` == "University") %>%
+  pull(`Percentage %`)
+
+no_university_percentage <- uk_education_totals %>%
+  filter(`Education Level` == "No University") %>%
+  pull(`Percentage %`)
+
+print(paste("UK 16+ population with University degree:", university_percentage))
+print(paste("UK 16+ population without University degree:", no_university_percentage))
+
+# Scotland vs England & Wales comparison
+scotland_uni_rate <- regional_education_breakdown %>%
+  filter(Region == "Scotland", `Education Level` == "University") %>%
+  pull(`% within Region`)
+
+ew_uni_rate <- regional_education_breakdown %>%
+  filter(Region == "England & Wales", `Education Level` == "University") %>%
+  pull(`% within Region`)
+
+print(paste("\nUniversity degree rates by region:"))
+print(paste("Scotland:", scotland_uni_rate, "%"))
+print(paste("England & Wales:", ew_uni_rate, "%"))
+
+# =============================================================================
+# PART 6: SAVE RESULTS
+# =============================================================================
+
+write_csv(uk_education_totals, "uk_education_proportions_16plus.csv")
+write_csv(regional_education_breakdown, "regional_education_breakdown_16plus.csv")
+
+print("\n=== FILES SAVED ===")
+print("- uk_education_proportions_16plus.csv")
+print("- regional_education_breakdown_16plus.csv")
+
+print("\n=== READY FOR POLL WEIGHTING ===")
+print("You now have UK-wide education proportions for 16+ population:")
+print("- University degree holders: X%") 
+print("- Non-university degree holders: Y%")
+print("These can be used as weighting targets for your polling!")
